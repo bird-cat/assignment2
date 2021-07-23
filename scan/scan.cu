@@ -28,6 +28,33 @@ static inline int nextPow2(int n)
     return n;
 }
 
+__global__ void
+upsweep_kernel(int N, int twod, int *arr)
+{
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int twod1 = twod << 1;
+    if (index < N && ((index + 1) & (twod1 - 1)) == 0)
+        arr[index] += arr[index - twod];
+}
+
+__global__ void
+downsweep_kernel(int N, int twod, int *arr)
+{
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int twod1 = twod << 1;
+    if (index < N && ((index + 1) & (twod1 - 1)) == 0) {
+        int tmp = arr[index];
+        arr[index] += arr[index - twod];
+        arr[index - twod] = tmp;
+    }
+}
+
+__global__ void
+set_zero_kernel(int *p)
+{
+    *p = 0;
+}
+
 void exclusive_scan(int* device_start, int length, int* device_result)
 {
     /* Fill in this function with your exclusive scan implementation.
@@ -39,6 +66,19 @@ void exclusive_scan(int* device_start, int length, int* device_result)
      * both the input and the output arrays are sized to accommodate the next
      * power of 2 larger than the input.
      */
+    int rounded_length = nextPow2(length);
+    int threadPerBlock = 512;
+    int blocks = (rounded_length + threadPerBlock - 1) / threadPerBlock;
+
+    for (int i = 1; i < rounded_length; i <<= 1) {
+        upsweep_kernel<<<blocks, threadPerBlock>>>(rounded_length, i, device_result);
+    }
+
+    set_zero_kernel<<<1, 1>>>(device_result + rounded_length - 1);
+
+    for (int i = rounded_length / 2; i >= 1; i >>= 1) {
+        downsweep_kernel<<<blocks, threadPerBlock>>>(rounded_length, i, device_result);
+    }
 }
 
 /* This function is a wrapper around the code you will write - it copies the
@@ -113,6 +153,23 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
     return overallDuration;
 }
 
+__global__ void
+tag_repeats_kernel(int *input, int N, int *output) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < N - 1 && input[index] == input[index + 1])
+        output[index] = 1;
+    else
+        output[index] = 0;
+}
+
+__global__ void
+filter_kernel(int *input, int N, int *output) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < N - 1 && input[index] + 1 == input[index + 1])
+        output[input[index]] = index;
+}
+
+
 int find_repeats(int *device_input, int length, int *device_output) {
     /* Finds all pairs of adjacent repeated elements in the list, storing the
      * indices of the first element of each pair (in order) into device_result.
@@ -125,7 +182,19 @@ int find_repeats(int *device_input, int length, int *device_output) {
      * it requires that. However, you must ensure that the results of
      * find_repeats are correct given the original length.
      */    
-    return 0;
+    int rounded_length = nextPow2(length);
+    int threadPerBlock = 512;
+    int blocks = (rounded_length + threadPerBlock - 1) / threadPerBlock;
+    int *device_isRepeat;
+    cudaMalloc((void**)&device_isRepeat, rounded_length * sizeof(int));
+
+    tag_repeats_kernel<<<blocks, threadPerBlock>>>(device_input, length, device_isRepeat);
+    exclusive_scan(device_isRepeat, rounded_length, device_isRepeat);
+    filter_kernel<<<blocks, threadPerBlock>>>(device_isRepeat, length, device_output);
+    int output_length;
+    cudaMemcpy(&output_length, &device_isRepeat[length - 1], sizeof(int), cudaMemcpyDeviceToHost);
+
+    return output_length;
 }
 
 /* Timing wrapper around find_repeats. You should not modify this function.
