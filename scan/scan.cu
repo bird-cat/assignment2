@@ -28,31 +28,52 @@ static inline int nextPow2(int n)
     return n;
 }
 
-__global__ void
-upsweep_kernel(int N, int twod, int *arr)
-{
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-    int twod1 = twod << 1;
-    if (index < N && ((index + 1) & (twod1 - 1)) == 0)
-        arr[index] += arr[index - twod];
-}
 
 __global__ void
-downsweep_kernel(int N, int twod, int *arr)
+prescan(int N, int *arr, int *sums)
 {
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-    int twod1 = twod << 1;
-    if (index < N && ((index + 1) & (twod1 - 1)) == 0) {
-        int tmp = arr[index];
-        arr[index] += arr[index - twod];
-        arr[index - twod] = tmp;
+    int block_index = blockIdx.x;
+    int tid = threadIdx.x;
+    int base_index = blockIdx.x * N;
+    extern __shared__ int temp[];
+    int i = 2 * tid;
+
+    if (i < N - 1) {
+        temp[i] = arr[base_index + i];
+        temp[i + 1] = arr[base_index + i + 1];
+        for (int d = 1; d < N; d <<= 1) {
+            __syncthreads();
+            int offset = d << 1;
+            if ((i & (offset - 1)) == 0) {
+                temp[i + offset - 1] += temp[i + d - 1];
+            }
+        }
+        if (tid == 0) {
+            sums[block_index] = temp[N - 1];
+            temp[N - 1] = 0;
+        }
+        for (int d = N >> 1; d > 0; d >>= 1) {
+            __syncthreads();
+            int offset = d << 1;
+            if ((i & (offset - 1)) == 0) {
+                int t = temp[i + d - 1];
+                temp[i + d - 1] = temp[i + offset - 1];
+                temp[i + offset - 1] += t;
+            }
+        }
+        __syncthreads();
+        arr[base_index + i] = temp[i];
+        arr[base_index + i + 1] = temp[i + 1];
     }
+    
 }
 
 __global__ void
-set_zero_kernel(int *p)
+add(int *a, int *b)
 {
-    *p = 0;
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int added = b[blockIdx.x];
+    a[index] += added;
 }
 
 void exclusive_scan(int* device_start, int length, int* device_result)
@@ -67,18 +88,21 @@ void exclusive_scan(int* device_start, int length, int* device_result)
      * power of 2 larger than the input.
      */
     int rounded_length = nextPow2(length);
-    int threadPerBlock = 512;
-    int blocks = (rounded_length + threadPerBlock - 1) / threadPerBlock;
+    int threadPerBlock = 64;
+    int elementPerBlock = threadPerBlock * 2;
+    int blocks = (rounded_length + elementPerBlock - 1) / elementPerBlock;
 
-    for (int i = 1; i < rounded_length; i <<= 1) {
-        upsweep_kernel<<<blocks, threadPerBlock>>>(rounded_length, i, device_result);
+    int *sums;
+    cudaMalloc((void**)&sums, blocks * sizeof(int));
+    prescan<<<blocks, threadPerBlock, elementPerBlock * sizeof(int)>>>(elementPerBlock, device_result, sums);
+
+    if (blocks > 1) {
+        int *sums_prefix = sums;
+        exclusive_scan(sums, blocks, sums_prefix);
+        add<<<blocks - 1, elementPerBlock>>>(device_result + elementPerBlock, sums_prefix + 1);
     }
 
-    set_zero_kernel<<<1, 1>>>(device_result + rounded_length - 1);
-
-    for (int i = rounded_length / 2; i >= 1; i >>= 1) {
-        downsweep_kernel<<<blocks, threadPerBlock>>>(rounded_length, i, device_result);
-    }
+    cudaFree(sums);
 }
 
 /* This function is a wrapper around the code you will write - it copies the
@@ -191,8 +215,10 @@ int find_repeats(int *device_input, int length, int *device_output) {
     tag_repeats_kernel<<<blocks, threadPerBlock>>>(device_input, length, device_isRepeat);
     exclusive_scan(device_isRepeat, rounded_length, device_isRepeat);
     filter_kernel<<<blocks, threadPerBlock>>>(device_isRepeat, length, device_output);
+
     int output_length;
     cudaMemcpy(&output_length, &device_isRepeat[length - 1], sizeof(int), cudaMemcpyDeviceToHost);
+    cudaFree(device_isRepeat);
 
     return output_length;
 }
