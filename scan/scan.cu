@@ -11,6 +11,10 @@
 
 #include "CycleTimer.h"
 
+#define NUM_BANKS 32
+#define LOG_NUM_BANKS 4
+#define CONFLICT_FREE_OFFSET(n) ((n) >> LOG_NUM_BANKS)
+
 extern float toBW(int bytes, float sec);
 
 
@@ -36,35 +40,47 @@ prescan(int N, int *arr, int *sums)
     int tid = threadIdx.x;
     int base_index = blockIdx.x * N;
     extern __shared__ int temp[];
-    int i = 2 * tid;
 
-    if (i < N - 1) {
-        temp[i] = arr[base_index + i];
-        temp[i + 1] = arr[base_index + i + 1];
-        for (int d = 1; d < N; d <<= 1) {
-            __syncthreads();
-            int offset = d << 1;
-            if ((i & (offset - 1)) == 0) {
-                temp[i + offset - 1] += temp[i + d - 1];
-            }
-        }
-        if (tid == 0) {
-            sums[block_index] = temp[N - 1];
-            temp[N - 1] = 0;
-        }
-        for (int d = N >> 1; d > 0; d >>= 1) {
-            __syncthreads();
-            int offset = d << 1;
-            if ((i & (offset - 1)) == 0) {
-                int t = temp[i + d - 1];
-                temp[i + d - 1] = temp[i + offset - 1];
-                temp[i + offset - 1] += t;
-            }
-        }
+    int i = tid * 2;
+    int a = tid;
+    int b = tid + N / 2;
+    int bankOffsetA = CONFLICT_FREE_OFFSET(a);
+    int bankOffsetB = CONFLICT_FREE_OFFSET(b);
+
+    temp[a + bankOffsetA] = arr[base_index + a];
+    temp[b + bankOffsetB] = arr[base_index + b];
+    for (int d = 1; d < N; d <<= 1) {
         __syncthreads();
-        arr[base_index + i] = temp[i];
-        arr[base_index + i + 1] = temp[i + 1];
+        int offset = d << 1;
+        if ((i & (offset - 1)) == 0) {
+            int ai = i + d - 1;
+            int bi = i + offset - 1;
+            ai += CONFLICT_FREE_OFFSET(ai);
+            bi += CONFLICT_FREE_OFFSET(bi);
+            temp[bi] += temp[ai];
+        }
     }
+    if (tid == 0) {
+        int padded_N = N - 1 + CONFLICT_FREE_OFFSET(N - 1);
+        sums[block_index] = temp[padded_N];
+        temp[padded_N] = 0;
+    }
+    for (int d = N >> 1; d > 0; d >>= 1) {
+        __syncthreads();
+        int offset = d << 1;
+        if ((i & (offset - 1)) == 0) {
+            int ai = i + d - 1;
+            int bi = i + offset - 1;
+            ai += CONFLICT_FREE_OFFSET(ai);
+            bi += CONFLICT_FREE_OFFSET(bi);
+            int t = temp[ai];
+            temp[ai] = temp[bi];
+            temp[bi] += t;
+        }
+    }
+    __syncthreads();
+    arr[base_index + a] = temp[a + bankOffsetA];
+    arr[base_index + b] = temp[b + bankOffsetB];
     
 }
 
@@ -88,7 +104,7 @@ void exclusive_scan(int* device_start, int length, int* device_result)
      * power of 2 larger than the input.
      */
     int rounded_length = nextPow2(length);
-    int threadPerBlock = 64;
+    int threadPerBlock = 128;
     int elementPerBlock = threadPerBlock * 2;
     int blocks = (rounded_length + elementPerBlock - 1) / elementPerBlock;
 
@@ -212,12 +228,32 @@ int find_repeats(int *device_input, int length, int *device_output) {
     int *device_isRepeat;
     cudaMalloc((void**)&device_isRepeat, rounded_length * sizeof(int));
 
-    tag_repeats_kernel<<<blocks, threadPerBlock>>>(device_input, length, device_isRepeat);
-    exclusive_scan(device_isRepeat, rounded_length, device_isRepeat);
-    filter_kernel<<<blocks, threadPerBlock>>>(device_isRepeat, length, device_output);
+    double startTime, endTime;
 
+    startTime = CycleTimer::currentSeconds();
+    tag_repeats_kernel<<<blocks, threadPerBlock>>>(device_input, length, device_isRepeat);
+    cudaThreadSynchronize();
+    endTime = CycleTimer::currentSeconds();
+    printf("tag time = %.3f\n", 1000.f * (endTime - startTime));
+
+    startTime = CycleTimer::currentSeconds();
+    exclusive_scan(device_isRepeat, rounded_length, device_isRepeat);
+    cudaThreadSynchronize();
+    endTime = CycleTimer::currentSeconds();
+    printf("scan time = %.3f\n", 1000.f * (endTime - startTime));
+
+    startTime = CycleTimer::currentSeconds();
+    filter_kernel<<<blocks, threadPerBlock>>>(device_isRepeat, length, device_output);
+    cudaThreadSynchronize();
+    endTime = CycleTimer::currentSeconds();
+    printf("filter time = %.3f\n", 1000.f * (endTime - startTime));
+
+    startTime = CycleTimer::currentSeconds();
     int output_length;
     cudaMemcpy(&output_length, &device_isRepeat[length - 1], sizeof(int), cudaMemcpyDeviceToHost);
+    cudaThreadSynchronize();
+    endTime = CycleTimer::currentSeconds();
+    printf("cpy time = %.3f\n", 1000.f * (endTime - startTime));
     cudaFree(device_isRepeat);
 
     return output_length;
