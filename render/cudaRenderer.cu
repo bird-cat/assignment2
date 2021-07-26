@@ -382,6 +382,7 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 // Each thread renders a circle.  Since there is no protection to
 // ensure order of update or mutual exclusion on the output image, the
 // resulting image will be incorrect.
+/*
 __global__ void kernelRenderCircles() {
 
     int index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -422,6 +423,30 @@ __global__ void kernelRenderCircles() {
             shadePixel(index, pixelCenterNorm, p, imgPtr);
             imgPtr++;
         }
+    }
+}
+*/
+
+__global__ void kernelRenderCircle(int circleIndex, int screenMinX, int screenMaxX, int screenMinY, int screenMaxY) {
+
+    // compute the bounding box of the circle. The bound is in integer
+    // screen coordinates, so it's clamped to the edges of the screen.
+    int index_x = blockIdx.x * blockDim.x + threadIdx.x;
+    int index_y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    int pixelX = screenMinX + index_x;
+    int pixelY = screenMinY + index_y;
+
+    if (pixelX < screenMaxX && pixelY < screenMaxY) {
+        float3 p = *(float3*)(&cuConstRendererParams.position[3 * circleIndex]);
+        short imageWidth = cuConstRendererParams.imageWidth;
+        short imageHeight = cuConstRendererParams.imageHeight;
+        float invWidth = 1.f / imageWidth;
+        float invHeight = 1.f / imageHeight;
+        float4 *imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+        float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                                invHeight * (static_cast<float>(pixelY) + 0.5f));
+        shadePixel(circleIndex, pixelCenterNorm, p, imgPtr);
     }
 }
 
@@ -633,11 +658,39 @@ CudaRenderer::advanceAnimation() {
 
 void
 CudaRenderer::render() {
+    cudaMemcpy(radius, cudaDeviceRadius, numCircles * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(position, cudaDevicePosition, numCircles * sizeof(float) * 3, cudaMemcpyDeviceToHost);
+    cudaThreadSynchronize();
 
-    // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
-    dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
+    for (int i = 0; i < numCircles; i++) {
+        // read position and radius
+        int index3 = 3 * i;
+        float px = position[index3];
+        float py = position[index3+1];
+        float rad = radius[i];
 
-    kernelRenderCircles<<<gridDim, blockDim>>>();
-    cudaDeviceSynchronize();
+        // compute the bounding box of the circle. The bound is in integer
+        // screen coordinates, so it's clamped to the edges of the screen.
+        float minX = px - rad;
+        float maxX = px + rad;
+        float minY = py - rad;
+        float maxY = py + rad;
+
+        // convert normalized coordinate bounds to integer screen
+        // pixel bounds.  Clamp to the edges of the screen.
+        int screenMinX = CLAMP(static_cast<int>(minX * image->width), 0, image->width);
+        int screenMaxX = CLAMP(static_cast<int>(maxX * image->width)+1, 0, image->width);
+        int screenMinY = CLAMP(static_cast<int>(minY * image->height), 0, image->height);
+        int screenMaxY = CLAMP(static_cast<int>(maxY * image->height)+1, 0, image->height);
+
+        short boxWidth = screenMaxX - screenMinX;
+        short boxHeight = screenMaxY - screenMinY;
+
+        int threadPerDim = 16;
+        dim3 threadPerBlock(threadPerDim, threadPerDim);
+        dim3 blocks((boxWidth + threadPerDim - 1) / threadPerDim, (boxHeight + threadPerDim - 1) / threadPerDim);
+
+        kernelRenderCircle<<<blocks, threadPerBlock>>>(i, screenMinX, screenMaxX, screenMinY, screenMaxY);
+    }
 }
+
